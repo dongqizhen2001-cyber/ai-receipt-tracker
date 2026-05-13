@@ -66,6 +66,13 @@ def normalize_result(result):
     return records
 
 
+def average_confidence(records):
+    scores = [float(item.get("score") or 0) for item in (records or [])]
+    if not scores:
+        return 0.0
+    return sum(scores) / len(scores)
+
+
 def _score_records(records):
     # Prefer results with more meaningful text and better confidence.
     if not records:
@@ -108,55 +115,85 @@ def _extract_receipt_region(image):
     return image[y0:y1, x0:x1]
 
 
+def _order_points(pts):
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def _find_receipt_contour(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 50, 150)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4:
+            return approx.reshape(4, 2)
+    return None
+
+
+def _warp_perspective(image, pts):
+    rect = _order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    max_width = int(max(width_a, width_b))
+
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_height = int(max(height_a, height_b))
+
+    if max_width <= 0 or max_height <= 0:
+        return None
+
+    dst = np.array(
+        [
+            [0, 0],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1],
+        ],
+        dtype="float32",
+    )
+    m = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(image, m, (max_width, max_height))
+
+
+def preprocess_image(image):
+    if image is None:
+        return None
+
+    base = _extract_receipt_region(image) or image
+    contour = _find_receipt_contour(base)
+    warped = _warp_perspective(base, contour) if contour is not None else base
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
 def robust_ocr(ocr_engine, image_path):
-    """Run OCR with crop/rotation fallbacks and return the best raw PaddleOCR result."""
+    """Run OCR after perspective correction + denoise to improve robustness."""
     image = cv2.imread(str(image_path))
     if image is None:
         return ocr_engine.ocr(str(image_path), cls=True)
 
-    roi = _extract_receipt_region(image)
-    base = roi if roi is not None else image
-
-    variants = [
-        base,
-        cv2.rotate(base, cv2.ROTATE_90_CLOCKWISE),
-        cv2.rotate(base, cv2.ROTATE_90_COUNTERCLOCKWISE),
-        cv2.rotate(base, cv2.ROTATE_180),
-    ]
-
-    # Upscale each variant for tiny-text photos.
-    upscale_variants = []
-    for item in variants:
-        h, w = item.shape[:2]
-        upscale_variants.append(cv2.resize(item, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC))
-    variants.extend(upscale_variants)
-
-    best_result = None
-    best_score = -1
-
-    for idx, var in enumerate(variants):
-        ok, encoded = cv2.imencode(".png", var)
-        if not ok:
-            continue
-        temp_name = str(Path(image_path).with_suffix(f".variant_{idx}.png"))
-        try:
-            with open(temp_name, "wb") as f:
-                f.write(encoded.tobytes())
-            raw = ocr_engine.ocr(temp_name, cls=True)
-            rec = normalize_result(raw)
-            score = _score_records(rec)
-            if score > best_score:
-                best_score = score
-                best_result = raw
-        finally:
-            try:
-                os.remove(temp_name)
-            except OSError:
-                pass
-
-    if best_result is None:
+    processed = preprocess_image(image)
+    if processed is None:
         return ocr_engine.ocr(str(image_path), cls=True)
-    return best_result
+    return ocr_engine.ocr(processed, cls=True)
 
 
 def build_clean_text(records):
@@ -179,12 +216,12 @@ def call_deepseek(clean_text, model):
 
     # 🔴 核心升级：告诉 AI 提取日期并估算卡路里
     system_prompt = (
-        "你是香港地区的智能财务与健康助手。请将用户提供的小票 OCR 文本提取为 JSON 格式。"
-        "必须且只能包含以下字段："
-        f"1. date: 消费日期 (格式 YYYY-MM-DD，如果小票没有写年份请默认{current_year}年，如果没有日期请留空)。"
-        "2. total_amount: 总金额 (纯数字)。"
-        "3. payment_method: 支付方式 (如 八达通, 现金, 信用卡等)。"
-        "4. items: 数组，每个元素包含 name(商品名), qty(数量, 默认为1), price(单价, 纯数字), calories_estimate(根据商品名称估算的卡路里整数值，比如可乐150，意粉600。如果是非食品如胶袋则为0)。"
+        "你是香港地区的智能财务与健康助手。请将用户提供的小票 OCR 文本提取为 JSON 格式。\n"
+        "必须且只能包含以下字段：\n"
+        f"1. date: 消费日期 (格式 YYYY-MM-DD，如果小票没有写年份请默认{current_year}年，如果没有日期请留空)。\n"
+        "2. total_amount: 总金额 (纯数字)。【非常重要】：请提取本次消费的实际支付金额（通常标为合计、总计、Total 或单个商品的加总）。绝不能提取“余额”、“八达通余额”、“Remaining Value”或“卡号”。\n"
+        "3. payment_method: 支付方式 (如 八达通, 现金, 信用卡等)。\n"
+        "4. items: 数组，每个元素包含 name(商品名), qty(数量, 默认为1), price(单价, 纯数字), calories_estimate(根据商品名称估算的卡路里整数值，比如可乐150，意粉600。如果是非食品如胶袋则为0)。\n"
         "只输出合法 JSON，不要输出任何解释标记或 Markdown 符号。"
     )
 
