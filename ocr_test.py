@@ -172,25 +172,104 @@ def _warp_perspective(image, pts):
     return cv2.warpPerspective(image, m, (max_width, max_height))
 
 
-def preprocess_image(image):
+def _rotate_bound(image, angle):
+    (h, w) = image.shape[:2]
+    center = (w / 2.0, h / 2.0)
+
+    m = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos = abs(m[0, 0])
+    sin = abs(m[0, 1])
+
+    new_w = int((h * sin) + (w * cos))
+    new_h = int((h * cos) + (w * sin))
+
+    m[0, 2] += (new_w / 2.0) - center[0]
+    m[1, 2] += (new_h / 2.0) - center[1]
+
+    return cv2.warpAffine(image, m, (new_w, new_h))
+
+
+def _estimate_skew_angle(gray):
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    coords = cv2.findNonZero(255 - thresh)
+    if coords is None:
+        return 0.0
+
+    rect = cv2.minAreaRect(coords)
+    angle = rect[-1]
+    if angle < -45:
+        angle = 90 + angle
+    return angle
+
+
+def _deskew_image(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    angle = _estimate_skew_angle(gray)
+    if abs(angle) < 0.8:
+        return image
+    return _rotate_bound(image, angle)
+
+
+def _enhance_low_light(image):
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l2 = clahe.apply(l)
+    merged = cv2.merge((l2, a, b))
+    boosted = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
+    blur = cv2.GaussianBlur(boosted, (0, 0), 1.2)
+    sharp = cv2.addWeighted(boosted, 1.4, blur, -0.4, 0)
+    return sharp
+
+
+def _auto_zoom(image, min_long_side=1200):
+    h, w = image.shape[:2]
+    long_side = max(h, w)
+    if long_side >= min_long_side:
+        return image
+
+    scale = min_long_side / float(long_side)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+
+
+def preprocess_image(image, auto_deskew=True, auto_enhance=True, auto_zoom=True):
     if image is None:
         return None
 
-    base = _extract_receipt_region(image) or image
+    # 把 or 拆开，用严格的 is None 判断，避开 Numpy 矩阵判断陷阱
+    base = _extract_receipt_region(image)
+    if base is None:
+        base = image
+    if auto_zoom:
+        base = _auto_zoom(base)
+        
     contour = _find_receipt_contour(base)
     warped = _warp_perspective(base, contour) if contour is not None else base
+    if auto_deskew:
+        warped = _deskew_image(warped)
+    if auto_enhance:
+        warped = _enhance_low_light(warped)
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
 
-def robust_ocr(ocr_engine, image_path):
+def robust_ocr(ocr_engine, image_path, auto_deskew=True, auto_enhance=True, auto_zoom=True):
     """Run OCR after perspective correction + denoise to improve robustness."""
     image = cv2.imread(str(image_path))
     if image is None:
         return ocr_engine.ocr(str(image_path), cls=True)
 
-    processed = preprocess_image(image)
+    processed = preprocess_image(
+        image,
+        auto_deskew=auto_deskew,
+        auto_enhance=auto_enhance,
+        auto_zoom=auto_zoom,
+    )
     if processed is None:
         return ocr_engine.ocr(str(image_path), cls=True)
     return ocr_engine.ocr(processed, cls=True)
@@ -215,6 +294,45 @@ def call_deepseek(clean_text, model):
     }
 
     # 🔴 核心升级：告诉 AI 提取日期并估算卡路里
+    system_prompt = (
+        "你是香港地区的智能财务与健康助手。请将用户提供的小票 OCR 文本提取为 JSON 格式。\n"
+        "必须且只能包含以下字段：\n"
+        f"1. date: 消费日期 (格式 YYYY-MM-DD，如果小票没有写年份请默认{current_year}年，如果没有日期请留空)。\n"
+        "2. total_amount: 总金额 (纯数字)。【非常重要】：请提取本次消费的实际支付金额（通常标为合计、总计、Total 或单个商品的加总）。绝不能提取“余额”、“八达通余额”、“Remaining Value”或“卡号”。\n"
+        "3. payment_method: 支付方式 (如 八达通, 现金, 信用卡等)。\n"
+        "4. items: 数组，每个元素包含 name(商品名), qty(数量, 默认为1), price(单价, 纯数字), calories_estimate(根据商品名称估算的卡路里整数值，比如可乐150，意粉600。如果是非食品如胶袋则为0)。\n"
+        "只输出合法 JSON，不要输出任何解释标记或 Markdown 符号。"
+    )
+
+    payload = {
+        "model": model,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": clean_text},
+        ],
+    }
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=90)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def call_doubao(clean_text, model, base_url=None, api_key=None):
+    api_key = (api_key or os.getenv("DOUBAO_API_KEY", "")).strip()
+    if not api_key:
+        raise RuntimeError("未设置 DOUBAO_API_KEY 环境变量")
+
+    current_year = datetime.now().year
+    api_base = (base_url or os.getenv("DOUBAO_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")).rstrip("/")
+    url = f"{api_base}/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
     system_prompt = (
         "你是香港地区的智能财务与健康助手。请将用户提供的小票 OCR 文本提取为 JSON 格式。\n"
         "必须且只能包含以下字段：\n"
