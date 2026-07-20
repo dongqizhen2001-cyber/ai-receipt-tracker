@@ -1,9 +1,8 @@
---find-links https://www.paddlepaddle.org.cn/whl/linux/cpu-wheels/html
 streamlit
 pandas
 plotly
 requests
 pillow
 opencv-python-headless
-paddlepaddle==2.6.1
+paddlepaddle
 paddleocr
