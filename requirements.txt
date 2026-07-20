@@ -2,6 +2,7 @@ streamlit
 pandas
 plotly
 requests
+Pillow
+opencv-python-headless
 paddlepaddle
 paddleocr
-opencv-python-headless
