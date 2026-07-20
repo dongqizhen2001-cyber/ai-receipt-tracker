@@ -2,7 +2,11 @@ import os
 os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["FLAGS_enable_pir_in_executor"] = "0"
 os.environ["FLAGS_use_onednn"] = "0"
+os.environ["OMP_NUM_THREADS"] = "1"   # 新增：限制 OpenMP 线程数为 1
+os.environ["CPU_NUM"] = "1"           # 新增：限制 Paddle 运算核心数为 1
+
 import streamlit as st
+# ... 下面的代码保持原样 ...
 import json
 import re
 from io import BytesIO
