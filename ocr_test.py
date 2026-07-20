@@ -2,6 +2,8 @@ import os
 os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["FLAGS_enable_pir_in_executor"] = "0"
 os.environ["FLAGS_use_onednn"] = "0"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["CPU_NUM"] = "1"
 import argparse
 import json
 from pathlib import Path
@@ -41,11 +43,11 @@ def parse_args():
 def init_ocr(lang):
     print("正在加载 OCR 模型，请稍候...")
     try:
-        return PaddleOCR(use_angle_cls=True, lang=lang, enable_mkldnn=False), lang
+        return PaddleOCR(use_angle_cls=False, use_gpu=False, enable_mkldnn=False), lang
     except Exception as exc:
         if lang == "chinese_cht":
             print(f"繁体模型初始化失败，自动回退到简中模型。原因: {exc}")
-            return PaddleOCR(use_angle_cls=True, lang="ch", enable_mkldnn=False), "ch"
+            return PaddleOCR(use_angle_cls=False, use_gpu=False, enable_mkldnn=False), "ch"
         raise
 
 
