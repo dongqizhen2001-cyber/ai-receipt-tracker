@@ -262,7 +262,7 @@ def robust_ocr(ocr_engine, image_path, auto_deskew=True, auto_enhance=True, auto
     """Run OCR after perspective correction + denoise to improve robustness."""
     image = cv2.imread(str(image_path))
     if image is None:
-        return ocr_engine.ocr(str(image_path), cls=True)
+        return ocr_engine.ocr(str(image_path))
 
     processed = preprocess_image(
         image,
@@ -271,8 +271,8 @@ def robust_ocr(ocr_engine, image_path, auto_deskew=True, auto_enhance=True, auto
         auto_zoom=auto_zoom,
     )
     if processed is None:
-        return ocr_engine.ocr(str(image_path), cls=True)
-    return ocr_engine.ocr(processed, cls=True)
+        return ocr_engine.ocr(str(image_path))
+    return ocr_engine.ocr(processed)
 
 
 def build_clean_text(records):
