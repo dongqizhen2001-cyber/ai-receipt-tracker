@@ -4,5 +4,5 @@ plotly
 requests
 Pillow
 opencv-python-headless
-paddlepaddle
+paddlepaddle==2.6.1
 paddleocr
