@@ -1,12 +1,4 @@
-import os
-os.environ["FLAGS_enable_pir_api"] = "0"
-os.environ["FLAGS_enable_pir_in_executor"] = "0"
-os.environ["FLAGS_use_onednn"] = "0"
-os.environ["OMP_NUM_THREADS"] = "1"   # 新增：限制 OpenMP 线程数为 1
-os.environ["CPU_NUM"] = "1"           # 新增：限制 Paddle 运算核心数为 1
-
-import streamlit as st
-# ... 下面的代码保持原样 ...
+﻿import streamlit as st
 import json
 import re
 from io import BytesIO
@@ -670,42 +662,78 @@ def parse_deepseek_json(raw_json):
     return json.loads(cleaned)
 
 
+_TOTAL_KEYWORDS = ("總計", "合計", "总计", "合计", "total", "實收", "实收",
+                   "實付", "实付", "應付", "应付", "金額", "金额", "amount")
+_PAY_KEYWORDS = ("八達通", "octopus", "ctopus", "wechat", "微信", "alipay",
+                 "支付寶", "支付宝", "現金", "现金", "cash")
+_BAD_KEYWORDS = ("card", "卡號", "机号", "機號", "balance", "餘額", "余额",
+                 "point", "積分")
+
+
 def _extract_amount_fallback(records, clean_text):
-    """Fallback amount extraction with context to avoid balance/card numbers."""
+    """Fallback amount extraction with context to avoid balance/card numbers.
+
+    Returns (amount, priority):
+      priority 2 = strong (line carries a total keyword),
+      priority 1 = medium (line carries a payment-method keyword),
+      priority 0 = weak (plain amount without any keyword).
+    The caller only overrides the LLM with a strong/medium fallback, or when
+    the LLM value is missing or clearly implausible.
+    """
     lines = [str(item.get("text", "")).strip() for item in records if str(item.get("text", "")).strip()]
-    amounts = []
-    
+    candidates = []
+
     for i, line in enumerate(lines):
         # Combine previous line to avoid OCR splitting balance and numbers.
         context = line.lower()
         if i > 0:
-            context = lines[i-1].lower() + " " + context
-            
+            context = lines[i - 1].lower() + " " + context
+
         # Skip balance/card related lines.
-        if any(x in context for x in ["card", "卡號", "机号", "機號", "balance", "餘額", "余额", "point", "積分"]):
+        if any(x in context for x in _BAD_KEYWORDS):
             continue
-            
+
         match = re.search(r"\$?(\d+\.\d{1,2})", line)
-        if match:
-            val = float(match.group(1))
-            if 0 < val < 1000:
-                amounts.append(val)
-                
-    # Prefer values near payment method keywords.
+        if not match:
+            continue
+        val = float(match.group(1))
+        if not (0 < val < 1000):
+            continue
+
+        if any(x in context for x in _TOTAL_KEYWORDS):
+            priority = 2
+        elif any(x in context for x in _PAY_KEYWORDS):
+            priority = 1
+        else:
+            priority = 0
+        candidates.append((val, priority, i))
+
+    if not candidates:
+        return None, -1
+
+    # Keyword-backed values win over plain amounts.
+    for p in (2, 1):
+        for val, pri, i in candidates:
+            if pri == p:
+                return round(val, 2), p
+
+    # Weak candidates: prefer the amount just above the stored-value footer
+    # (the total usually sits right before 卡號/餘額 lines), otherwise take
+    # the largest amount, which is more likely the total than an item price.
+    first_bad = len(lines)
     for i, line in enumerate(lines):
         context = line.lower()
-        if i > 0: context = lines[i-1].lower() + " " + context
-        if any(x in context for x in ["八達通", "wechat", "alipay", "微信", "支付寶", "現金", "cash", "總計", "total", "实收"]):
-            if not any(x in context for x in ["card", "卡號", "balance", "餘額", "余额"]):
-                match = re.search(r"\$?(\d+\.\d{1,2})", line)
-                if match:
-                    val = float(match.group(1))
-                    if 0 < val < 1000:
-                        return round(val, 2)
-                        
-    if amounts:
-        return round(min(amounts), 2)
-    return None
+        if i > 0:
+            context = lines[i - 1].lower() + " " + context
+        if any(x in context for x in _BAD_KEYWORDS):
+            first_bad = i
+            break
+    above = [c for c in candidates if c[2] < first_bad]
+    if above:
+        best = max(above, key=lambda c: (c[2], c[0]))
+    else:
+        best = max(candidates, key=lambda c: c[0])
+    return round(best[0], 2), 0
 
 
 @st.cache_resource(show_spinner=False)
@@ -730,15 +758,29 @@ def finalize_llm_from_clean_text(clean_text, records, api_key, model, base_url=N
     except (TypeError, ValueError):
         current_amount_num = 0.0
 
-    fallback_amount = _extract_amount_fallback(records, clean_text)
-    
+    fallback_amount, fallback_priority = _extract_amount_fallback(records, clean_text)
+
     if fallback_amount is not None:
         delta_ratio = abs(current_amount_num - fallback_amount) / max(fallback_amount, 1)
-        if current_amount_num <= 0 or current_amount_num > 10 * fallback_amount or delta_ratio > 0.2:
+        if current_amount_num <= 0 or current_amount_num > 10 * fallback_amount:
             print(
                 f"[Amount fallback] AI amount ${current_amount_num} overridden to ${fallback_amount}."
             )
             data["total_amount"] = round(fallback_amount, 2)
+        elif fallback_priority > 0 and delta_ratio > 0.2:
+            # Keyword-backed fallback disagrees strongly with the LLM.
+            print(
+                f"[Amount fallback] AI amount ${current_amount_num} overridden to "
+                f"${fallback_amount} (priority {fallback_priority})."
+            )
+            data["total_amount"] = round(fallback_amount, 2)
+        elif fallback_priority == 0 and delta_ratio > 0.2:
+            # Weak evidence only: keep the LLM value instead of risking a
+            # wrong override with a plain item price.
+            print(
+                f"[Amount fallback] kept AI amount ${current_amount_num} "
+                f"(weak fallback ${fallback_amount} ignored)."
+            )
 
     # Force payment method from text when possible to avoid hallucinations.
     text_lower = clean_text.lower()

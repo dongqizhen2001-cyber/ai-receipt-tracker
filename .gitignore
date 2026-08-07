@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Local runtime data
+finance.db
+app_settings.json
+output/
+output_ch/
+temp_scan.png
+
+# OS/editor
+.vscode/*.log
+.DS_Store
+Thumbs.db

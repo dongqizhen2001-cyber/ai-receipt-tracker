@@ -1,9 +1,4 @@
 import os
-os.environ["FLAGS_enable_pir_api"] = "0"
-os.environ["FLAGS_enable_pir_in_executor"] = "0"
-os.environ["FLAGS_use_onednn"] = "0"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["CPU_NUM"] = "1"
 import argparse
 import json
 from pathlib import Path
@@ -43,11 +38,11 @@ def parse_args():
 def init_ocr(lang):
     print("正在加载 OCR 模型，请稍候...")
     try:
-      return PaddleOCR(use_angle_cls=False, lang=lang, enable_mkldnn=False), lang
+        return PaddleOCR(use_angle_cls=True, lang=lang), lang
     except Exception as exc:
         if lang == "chinese_cht":
             print(f"繁体模型初始化失败，自动回退到简中模型。原因: {exc}")
-            return PaddleOCR(use_angle_cls=False, lang="ch", enable_mkldnn=False), "ch"
+            return PaddleOCR(use_angle_cls=True, lang="ch"), "ch"
         raise
 
 
@@ -264,10 +259,13 @@ def preprocess_image(image, auto_deskew=True, auto_enhance=True, auto_zoom=True)
 
 
 def robust_ocr(ocr_engine, image_path, auto_deskew=True, auto_enhance=True, auto_zoom=True):
-    """Run OCR after perspective correction + denoise to improve robustness."""
+    """Run OCR on both the preprocessed image and the raw image, then keep
+    the result that carries more usable text.  This rescues photos where the
+    preprocessing step over-processes the thermal paper (e.g. drops the total
+    line), while still benefiting from CLAHE/deskew on faded or tilted shots."""
     image = cv2.imread(str(image_path))
     if image is None:
-        return ocr_engine.ocr(str(image_path))
+        return ocr_engine.ocr(str(image_path), cls=True)
 
     processed = preprocess_image(
         image,
@@ -275,9 +273,26 @@ def robust_ocr(ocr_engine, image_path, auto_deskew=True, auto_enhance=True, auto
         auto_enhance=auto_enhance,
         auto_zoom=auto_zoom,
     )
-    if processed is None:
-        return ocr_engine.ocr(str(image_path))
-    return ocr_engine.ocr(processed)
+
+    candidates = []
+    if processed is not None:
+        candidates.append(("processed", ocr_engine.ocr(processed, cls=True)))
+    try:
+        candidates.append(("raw", ocr_engine.ocr(image, cls=True)))
+    except Exception:
+        pass
+
+    if not candidates:
+        return ocr_engine.ocr(str(image_path), cls=True)
+
+    best = candidates[0][1]
+    best_score = -1.0
+    for label, res in candidates:
+        score = _score_records(normalize_result(res))
+        if score > best_score:
+            best_score = score
+            best = res
+    return best
 
 
 def build_clean_text(records):
